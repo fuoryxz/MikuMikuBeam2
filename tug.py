@@ -85,7 +85,7 @@ def cmd_doctor(args) -> int:
         return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     check("python3", _py_ver)
 
-    for f in ["client.c", "server.py", "fake_bots.py", "CMakeLists.txt"]:
+    for f in ["client.c", "server.py", "test.py", "CMakeLists.txt"]:
         p = ROOT / f
         if p.exists():
             log(f"  file {f}: {p.stat().st_size} bytes", "ok")
@@ -223,7 +223,7 @@ def cmd_ports(args) -> int:
 
 # ---------- smoke ----------
 def cmd_smoke(args) -> int:
-    """Запускает сервер + fake_bots, проверяет HELLO, CMD, stop."""
+    """Запускает сервер + test, проверяет HELLO, CMD, stop."""
     psk = args.psk or os.urandom(32).hex()
     if not _is_valid_psk(psk):
         log("invalid PSK", "err")
